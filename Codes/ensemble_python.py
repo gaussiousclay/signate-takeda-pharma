@@ -85,7 +85,7 @@ def fit_cb(X_fit, y_fit, X_val, y_val, counter, cb_path, name):
     model = cb.CatBoostRegressor(iterations=999999,
                                   learning_rate=0.016,
                                   colsample_bylevel=0.782,
-                                  max_depth = 15,
+                                  max_depth = 5,
                                   objective="RMSE")
                                   
     model.fit(X_fit, y_fit, 
