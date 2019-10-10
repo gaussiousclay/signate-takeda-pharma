@@ -9,7 +9,7 @@ import pandas as pd
 import numpy as np
 import math
 import matplotlib.pyplot as plt
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import KFold
 from sklearn.metrics import mean_squared_error
 import lightgbm as lgb
 import xgboost as xgb
@@ -22,23 +22,29 @@ from h2o.grid.grid_search import H2OGridSearch
 from h2o.estimators.deeplearning import H2ODeepLearningEstimator
 from xgboost import plot_importance
 from matplotlib import pyplot
+from pathlib import Path
+from sklearn import preprocessing
+from sklearn.preprocessing import StandardScaler,MinMaxScaler
+from sklearn.metrics import r2_score
 gc.enable()
 
 
 def fit_lgb(X_fit, y_fit, X_val, y_val, counter, lgb_path, name):
     
-    model = lgb.LGBMRegressor(max_depth=-1,
+    model = lgb.LGBMRegressor(max_depth=30,
                               n_estimators=999999,
-                              learning_rate=0.005,
-                              colsample_bytree=0.4,
-                              num_leaves=5,
+                              learning_rate=0.016,
+                              colsample_bytree=0.782,
+                              subsample = 0.609,
+                              min_child_weight = 46,
                               metric='rmse',
+                              num_leaves = 10,
                               objective='regression', 
                               n_jobs=-1)
      
     model.fit(X_fit, y_fit, 
               eval_set=[(X_val, y_val)],
-              verbose=0, 
+              verbose=100, 
               early_stopping_rounds=50)
                   
     cv_val = model.predict(X_val)
@@ -51,18 +57,19 @@ def fit_lgb(X_fit, y_fit, X_val, y_val, counter, lgb_path, name):
     
 def fit_xgb(X_fit, y_fit, X_val, y_val, counter, xgb_path, name):
     
-    model = xgb.XGBRegressor(max_depth=10,
+    model = xgb.XGBRegressor(max_depth=30,
                              n_estimators=999999,
-                             colsample_bytree=0.731,
-                             learning_rate=0.027,
-                             subasample = 0.673,
-                             min_child_weight = 9.56,
+                             colsample_bytree=0.782,
+                             learning_rate=0.016,
+                             subsample = 0.609,
+                             min_child_weight = 46,
+                             num_leaves = 10,
                              objective='reg:linear', 
                              n_jobs=-1)
      
     model.fit(X_fit, y_fit, 
               eval_set=[(X_val, y_val)], 
-              verbose=0, 
+              verbose=100, 
               early_stopping_rounds=50)
               
     cv_val = model.predict(X_val)
@@ -76,13 +83,14 @@ def fit_xgb(X_fit, y_fit, X_val, y_val, counter, xgb_path, name):
 def fit_cb(X_fit, y_fit, X_val, y_val, counter, cb_path, name):
     
     model = cb.CatBoostRegressor(iterations=999999,
-                                  learning_rate=0.005,
-                                  colsample_bylevel=0.03,
+                                  learning_rate=0.016,
+                                  colsample_bylevel=0.782,
+                                  max_depth = 15,
                                   objective="RMSE")
                                   
     model.fit(X_fit, y_fit, 
               eval_set=[(X_val, y_val)], 
-              verbose=0, early_stopping_rounds=100)
+              verbose=100, early_stopping_rounds=100)
               
     cv_val = model.predict(X_val)
     
@@ -93,55 +101,85 @@ def fit_cb(X_fit, y_fit, X_val, y_val, counter, cb_path, name):
     return cv_val
 
 
-def train_stage(df_path, lgb_path, xgb_path, cb_path):
+def pre_process_train_test(train,test):
+    one_value_cols = [col for col in train.columns if train[col].nunique() <= 1]
+    one_value_cols_test = [col for col in test.columns if test[col].nunique() <= 1]
+
+    many_null_cols = [col for col in train.columns if train[col].isnull().sum() / train.shape[0] > 0.9]
+    many_null_cols_test = [col for col in test.columns if test[col].isnull().sum() / test.shape[0] > 0.9]
+
+    big_top_value_cols = [col for col in train.columns if train[col].value_counts(dropna=False, normalize=True).values[0] > 0.9]
+    big_top_value_cols_test = [col for col in test.columns if test[col].value_counts(dropna=False, normalize=True).values[0] > 0.9]
+
+    cols_to_drop = list(set(many_null_cols + many_null_cols_test + big_top_value_cols + big_top_value_cols_test + one_value_cols + one_value_cols_test))
+    print('{} features are going to be dropped for being useless'.format(len(cols_to_drop)))
+
+    train = train.drop(cols_to_drop, axis=1)
+    test = test.drop(cols_to_drop, axis=1)
+
+    print(f'Train dataset after removing garbage: {train.shape[0]} rows & {train.shape[1]} columns')
+    print(f'Test dataset after removing garbage: {test.shape[0]} rows & {test.shape[1]} columns')
+
+    train = train.replace(np.inf,999)
+    test = test.replace(np.inf,999)
+    scaler = preprocessing.MinMaxScaler()
+    train = pd.DataFrame(scaler.fit_transform(train),columns=train.columns)
+    test = pd.DataFrame(scaler.fit_transform(test),columns=train.columns)
+    
+    return train,test
+
+
+
+def train_stage(train,target,trainid, lgb_path, xgb_path, cb_path):
     
     print('Load Train Data.')
-    df_train_features = pd.read_csv(train_path)
-    df_train = pd.get_dummies(df_train_features,columns=['companyId','jobType','degree','major','industry'])
-    df_target = pd.read_csv(target_path)
-    df_train = pd.merge(df_train,df_target)
+    df_train = train
+    df_target = target
     print('\nShape of Train Data: {}'.format(df_train.shape))
     
-    y_df = np.array(df_train['salary'])                        
-    df_ids = np.array(df_train.jobId)                     
-    df_train.drop(['jobId', 'salary'], axis=1, inplace=True)
+    y_df = df_target                     
+    df_ids = np.array(trainid)                     
     
     lgb_cv_result = np.zeros(df_train.shape[0])
     xgb_cv_result = np.zeros(df_train.shape[0])
     cb_cv_result  = np.zeros(df_train.shape[0])
     
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    skf.get_n_splits(df_ids, y_df)
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    kf.get_n_splits(df_ids, y_df)
     
     print('\nModel Fitting...')
-    for counter, ids in enumerate(skf.split(df_ids, y_df)):
+    for counter, ids in enumerate(kf.split(df_ids, y_df)):
         print('\nFold {}'.format(counter+1))
         X_fit, y_fit = df_train.values[ids[0]], y_df[ids[0]]
         X_val, y_val = df_train.values[ids[1]], y_df[ids[1]]
     
+        print('CatBoost')
+        cb_cv_result[ids[1]]  += fit_cb(X_fit,  y_fit, X_val, y_val, counter, cb_path,  name='cb')
+        
         print('LightGBM')
         lgb_cv_result[ids[1]] += fit_lgb(X_fit, y_fit, X_val, y_val, counter, lgb_path, name='lgb')
         print('XGBoost')
         xgb_cv_result[ids[1]] += fit_xgb(X_fit, y_fit, X_val, y_val, counter, xgb_path, name='xgb')
-        print('CatBoost')
-        cb_cv_result[ids[1]]  += fit_cb(X_fit,  y_fit, X_val, y_val, counter, cb_path,  name='cb')
         
         del X_fit, X_val, y_fit, y_val
         gc.collect()
     
-    rmse_lgb  = round(math.sqrt(mean_squared_error(y_df, lgb_cv_result)),4)
-    rmse_xgb  = round(math.sqrt(mean_squared_error(y_df, xgb_cv_result)),4)
-    rmse_cb   = round(math.sqrt(mean_squared_error(y_df, cb_cv_result)), 4)
-    rmse_mean = round(math.sqrt(mean_squared_error(y_df, (lgb_cv_result+xgb_cv_result+cb_cv_result)/3)), 4)
-    rmse_mean_lgb_cb = round(math.sqrt(mean_squared_error(y_df, (lgb_cv_result+cb_cv_result)/2)), 4)
-    print('\nLightGBM VAL RMSE: {}'.format(rmse_lgb))
-    print('XGBoost  VAL RMSE: {}'.format(rmse_xgb))
-    print('Catboost VAL RMSE: {}'.format(rmse_cb))
-    print('Mean Catboost+LightGBM VAL RMSE: {}'.format(rmse_mean_lgb_cb))
-    print('Mean XGBoost+Catboost+LightGBM, VAL RMSE: {}\n'.format(rmse_mean))
+    
+    rsq_lgb = round(r2_score(y_df,lgb_cv_result),4)
+    rsq_xgb = round(r2_score(y_df,xgb_cv_result),4)
+    rsq_cb = round(r2_score(y_df,cb_cv_result),4)
+    rsq_mean = round(r2_score(y_df, (lgb_cv_result+xgb_cv_result+cb_cv_result)/3), 4)
+    rsq_mean_lgb_cb = round(r2_score(y_df, (lgb_cv_result+cb_cv_result)/2), 4)
+    print('\nLightGBM VAL RSQ: {}'.format(rsq_lgb))
+    print('XGBoost  VAL RSQ: {}'.format(rsq_xgb))
+    print('Catboost VAL RSQ: {}'.format(rsq_cb))
+    print('Mean Catboost+LightGBM VAL RSQ: {}'.format(rsq_mean_lgb_cb))
+    print('Mean XGBoost+Catboost+LightGBM, VAL RSQ: {}\n'.format(rsq_mean))
     
     return 0
-    
+
+
+"""    
     
 def stacking_and_prediction_stage(train_path, lgb_path, xgb_path, cb_path,test_path):
    
@@ -319,25 +357,34 @@ def stacking_and_prediction_stage(train_path, lgb_path, xgb_path, cb_path,test_p
     return 0
 
 
+"""
+
 
     
 if __name__ == '__main__':
     
-    train_path = 'D:\Analytics Repository\Indeed/train_features.csv'
-    target_path = 'D:\Analytics Repository\Indeed/train_salaries.csv'
-    test_path  = 'D:\Analytics Repository\Indeed/test_features.csv'
     
-    lgb_path = 'D:\Analytics Repository\Indeed\lgb_models_stack/'
-    xgb_path = 'D:\Analytics Repository\Indeed\exgb_models_stack/'
-    cb_path = 'D:\Analytics Repository\Indeed\cb_models_stack/'
- 
-    #Create dir for models
+    folder_path = str(Path().absolute())
+    lgb_path = folder_path+'/Models/lgb_models/'
+    xgb_path = folder_path+'/Models/xgb_models/'
+    cb_path = folder_path+'/Models/cb_models/'
+    #Create dir for models if they dont exist already
     #os.mkdir(lgb_path)
     #os.mkdir(xgb_path)
     #os.mkdir(cb_path)
-    #os.mkdir(xgb_stacking_path)
+    train_path = folder_path+'/train.csv'
+    test_path  = folder_path+'/test.csv'
+    
+    train = pd.read_csv(train_path)
+    test = pd.read_csv(test_path)
+    target = train['Score']
+    trainid = train['ID']
+    testid = test['ID']
+    train.drop(['Score','ID'],axis=1,inplace=True)
+    test.drop(['ID'],axis=1,inplace=True)
+    train,test = pre_process_train_test(train,test)
 
-    train_stage(train_path, lgb_path, xgb_path, cb_path)
+    train_stage(train,target,trainid,lgb_path, xgb_path, cb_path)
     #Stacking Stage
     print('Commencing Stacking and Prediction Stage.\n')
     stacking_and_prediction_stage(train_path, lgb_path, xgb_path, cb_path,test_path)
